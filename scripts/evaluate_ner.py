@@ -2,6 +2,9 @@ import os
 import re
 import torch
 import torch.nn.functional as F
+from transformers import pipeline
+import copy
+import re
 
 from tqdm import tqdm
 import pandas as pd
@@ -12,19 +15,22 @@ from dotenv import find_dotenv, load_dotenv
 
 print(load_dotenv(find_dotenv(".env")))
 
+import regex  # Note: This is NOT the built-in 're' module
+
 def split_sentence_with_indices(text):
     pattern = r'''
         (?:
-            \d+[.,]?\d*\s*[%$€]?
-        )                                     # Numbers with optional decimal/currency
+            \p{N}+[.,]?\p{N}*\s*[%$€]?           # Numbers with optional decimal/currency
+        )
         |
-        [A-Za-zÀ-ÖØ-öø-ÿ0-9]+(?:-[A-Za-z0-9]+)*  # Words with optional hyphens (e.g., anti-TNF)
+        \p{L}+(?:-\p{L}+)*                      # Words with optional hyphens (letters from any language)
         |
-        [()\[\]{}]                             # Parentheses and brackets
+        [()\[\]{}]                              # Parentheses and brackets
         |
-        [^\w\s]                                # Other single punctuation marks
+        [^\p{L}\p{N}\s]                         # Other single punctuation marks
     '''
-    return list(re.finditer(pattern, text, flags=re.VERBOSE))
+    return list(regex.finditer(pattern, text, flags=regex.VERBOSE))
+
 
 
 
@@ -79,8 +85,8 @@ def load_tsv_to_dataframe(file_path: str) -> pd.DataFrame:
 
 class PredictionNER:
     def __init__(self, model_checkpoint, revision) -> None:
-        MAX_LENGTH = 450
-        OVERLAPPING_LEN = 10 
+        MAX_TOKENS_IOB_SENT = 256
+        OVERLAPPING_LEN = 0
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_checkpoint, revision=revision, is_split_into_words=True, truncation=False
@@ -90,11 +96,16 @@ class PredictionNER:
         )
         self.text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             encoding_name='o200k_base',
-            separators=["\n\n\n", "\n\n", "\n", ".", ",", " ", ""],
-            keep_separator=False,
-            chunk_size=MAX_LENGTH,
+            separators=["\n\n\n", "\n\n", "\n", " .", " !", " ?", " ،", " ,", " ", ""],
+            keep_separator=True,
+            chunk_size=MAX_TOKENS_IOB_SENT,
             chunk_overlap=OVERLAPPING_LEN,
         )
+
+
+        # Use a pipeline as a high-level helper
+
+        self.pipe = pipeline("token-classification", model=model_checkpoint, revision=revision, aggregation_strategy="average")
 
         ner_labels = list(self.model.config.id2label.values())
         self.base_entity_types = sorted(
@@ -103,30 +114,41 @@ class PredictionNER:
 
 
     def split_text_with_indices(self, text):
-        offset = 0
-        for doc in self.text_splitter.split_text(text):
-            # Search for doc within the remaining text
-            start_idx = text.find(doc, offset)
-            if start_idx == -1:
-                continue  # should not happen, but skip just in case
-            end_idx = start_idx + len(doc)
-            offset = end_idx  # move search window forward
-            yield doc, start_idx, end_idx
+        
+        raw_chunks = self.text_splitter.split_text(text)
 
-    def predict_text(self, text: str, confidence_threshold: float = 0.7):
+        # Align each chunk manually by finding its first occurrence in text
+        used_indices = set()
+        # chunks = []
+
+        for chunk_text in raw_chunks:
+            # Find the first unique match position in text to use as a start index
+            start_index = text.find(chunk_text)
+
+            # Prevent collisions if chunk_text repeats (naïve fallback)
+            while start_index in used_indices:
+                start_index = text.find(chunk_text, start_index + 1)
+            used_indices.add(start_index)
+
+            end_index = start_index + len(chunk_text)
+            
+            yield chunk_text, start_index, end_index
+            
+
+    def predict_text(self, text: str, o_confidence_threshold: float = 0.70):
         # 1. Split text into words and punctuation using regex
-        text_matches = split_sentence_with_indices(text)  # list(re.finditer(r'([0-9A-Za-zÀ-ÖØ-öø-ÿ]+|[^0-9A-Za-zÀ-ÖØ-öø-ÿ])', text))
+        text_matches = split_sentence_with_indices(text)
 
         # 2. Strip and filter out empty or whitespace-only tokens
         text_words = [m.group().strip() for m in text_matches if m.group().strip()]
 
         if not text_words:
-            return []  # return early if nothing valid
+            return []
 
         # 3. Tokenize with word alignment
         inputs = self.tokenizer(
-            text_words, 
-            return_tensors="pt", 
+            text_words,
+            return_tensors="pt",
             is_split_into_words=True,
             truncation=False
         )
@@ -143,6 +165,7 @@ class PredictionNER:
         results = []
         seen = set()
         non_empty_matches = [m for m in text_matches if m.group().strip()]
+        id2label = self.model.config.id2label
 
         for i, word_idx in enumerate(word_ids):
             if word_idx is None or word_idx in seen:
@@ -150,16 +173,23 @@ class PredictionNER:
             seen.add(word_idx)
 
             word = text_words[word_idx]
-            tag_id = predictions[i].item()
-            tag = self.model.config.id2label[tag_id]
-            score = probs[0, i, tag_id].item()
             start = non_empty_matches[word_idx].start()
             end = non_empty_matches[word_idx].end()
 
-            # Apply the confidence threshold filter
-            if score < confidence_threshold:
-                tag = "O"  # Assign "O" tag if confidence is below threshold
-                score = 0.0  # Set score to 0 for "O" tag
+            tag_id = predictions[i].item()
+            tag = id2label[tag_id]
+            score = probs[0, i, tag_id].item()
+
+            # If the tag is "O" and its confidence is low, try to find the next best non-"O" label
+            if tag == "O" and score < o_confidence_threshold:
+                sorted_probs = torch.argsort(probs[0, i], descending=True)
+                for alt_id in sorted_probs:
+                    alt_tag = id2label[alt_id.item()]
+                    if alt_tag != "O":
+                        tag_id = alt_id.item()
+                        tag = alt_tag
+                        score = probs[0, i, tag_id].item()
+                        break  # take the first non-"O" alternative
 
             results.append({
                 'word': word,
@@ -171,27 +201,39 @@ class PredictionNER:
 
         return results
 
+
+
+
+
     def aggregate_entities(self, tagged_tokens, original_text, confidence_threshold=0.3):
-        # Step 1: Preprocess tags based on the two rules
-        corrected_tokens = tagged_tokens.copy()
+        def is_special_char(text):
+            return bool(re.fullmatch(r"\W+", text.strip()))
 
-        # Rule 1: Fix "O" between "B-" and "I-" of the same type
-        for i in range(1, len(tagged_tokens) - 1):
-            prev_tag = tagged_tokens[i - 1]["tag"]
-            curr_tag = tagged_tokens[i]["tag"]
-            next_tag = tagged_tokens[i + 1]["tag"]
+        def finalize_entity(entity):
+            if all(s >= confidence_threshold for s in entity["scores"]):
+                entity_text = original_text[entity["start"]:entity["end"]]
+                if not is_special_char(entity_text):
+                    entity["text"] = entity_text
+                    entity["score"] = sum(entity["scores"]) / len(entity["scores"])
+                    del entity["scores"]
+                    return entity
+            return None
 
-            if (
-                curr_tag == "O" and
-                prev_tag.startswith("B-") and
-                next_tag.startswith("I-")
-            ):
+        corrected_tokens = copy.deepcopy(tagged_tokens)
+
+        # Rule 1: Fix "O" between "B-" and "I-" of same type
+        for i in range(1, len(corrected_tokens) - 1):
+            prev_tag = corrected_tokens[i - 1]["tag"]
+            curr_tag = corrected_tokens[i]["tag"]
+            next_tag = corrected_tokens[i + 1]["tag"]
+
+            if curr_tag == "O" and prev_tag.startswith("B-") and next_tag.startswith("I-"):
                 prev_type = prev_tag[2:]
                 next_type = next_tag[2:]
                 if prev_type == next_type:
                     corrected_tokens[i]["tag"] = "I-" + prev_type
 
-        # Rule 2: Convert isolated or starting I- to B-
+        # Rule 2: Convert isolated I- to B-
         last_tag_type = None
         for i in range(len(corrected_tokens)):
             tag = corrected_tokens[i]["tag"]
@@ -199,19 +241,17 @@ class PredictionNER:
                 tag_type = tag[2:]
                 if last_tag_type != tag_type:
                     corrected_tokens[i]["tag"] = "B-" + tag_type
-                    last_tag_type = tag_type
-                else:
-                    last_tag_type = tag_type
+                last_tag_type = tag_type
             elif tag.startswith("B-"):
                 last_tag_type = tag[2:]
             else:
                 last_tag_type = None
 
-        # Step 2: Apply original aggregation logic
+        # Step 2: Aggregate entities
         entities = []
         current_entity = None
 
-        for item in corrected_tokens:
+        for idx, item in enumerate(corrected_tokens):
             tag = item["tag"]
             start = item["start"]
             end = item["end"]
@@ -219,17 +259,22 @@ class PredictionNER:
 
             if tag.startswith("B-"):
                 if current_entity:
-                    if all(s >= confidence_threshold for s in current_entity["scores"]):
-                        current_entity["text"] = original_text[current_entity["start"]:current_entity["end"]]
-                        current_entity["score"] = sum(current_entity["scores"]) / len(current_entity["scores"])
-                        del current_entity["scores"]
-                        entities.append(current_entity)
-                    current_entity = None
-                tag_type = tag[2:]
+                    # Check if current should be merged (same type and touching or separated by only whitespace)
+                    if (current_entity["tag"] == tag[2:] and 
+                        (current_entity["end"] == start or
+                        original_text[current_entity["end"]:start].isspace())):
+                        # Merge
+                        current_entity["end"] = end
+                        current_entity["scores"].append(score)
+                        continue
+                    else:
+                        finalized = finalize_entity(current_entity)
+                        if finalized:
+                            entities.append(finalized)
                 current_entity = {
                     "start": start,
                     "end": end,
-                    "tag": tag_type,
+                    "tag": tag[2:],
                     "scores": [score]
                 }
 
@@ -246,45 +291,38 @@ class PredictionNER:
                         "scores": [score]
                     }
 
-            else:  # "O"
+            else:  # tag == "O"
                 if current_entity:
-                    if all(s >= confidence_threshold for s in current_entity["scores"]):
-                        current_entity["text"] = original_text[current_entity["start"]:current_entity["end"]]
-                        current_entity["score"] = sum(current_entity["scores"]) / len(current_entity["scores"])
-                        del current_entity["scores"]
-                        entities.append(current_entity)
+                    finalized = finalize_entity(current_entity)
+                    if finalized:
+                        entities.append(finalized)
                     current_entity = None
 
+        # Finalize last entity
         if current_entity:
-            if all(s >= confidence_threshold for s in current_entity["scores"]):
-                current_entity["text"] = original_text[current_entity["start"]:current_entity["end"]]
-                current_entity["score"] = sum(current_entity["scores"]) / len(current_entity["scores"])
-                del current_entity["scores"]
-                entities.append(current_entity)
+            finalized = finalize_entity(current_entity)
+            if finalized:
+                entities.append(finalized)
 
         return entities
 
 
+
     def do_prediction(self, text, confidence_threshold=0.6):
         final_prediction = []
+        # final_prediction_2 = []
         for sub_text, sub_text_start, sub_text_end in self.split_text_with_indices(text):
-            tokens = self.predict_text(text=sub_text, confidence_threshold=confidence_threshold)
+            tokens = self.predict_text(text=sub_text)
             predictions = self.aggregate_entities(tokens, sub_text, confidence_threshold=confidence_threshold)
-
 
             for pred in predictions:
                 pred["start"] += sub_text_start
                 pred["end"] += sub_text_start
                 final_prediction.append(pred)
+                
+                
 
-        final_prediction_dict = {
-            lab: [p for p in final_prediction if p["tag"] == lab]
-            for lab in self.base_entity_types
-        }
-        merged_predictions = []
-        for label in self.base_entity_types:
-            merged_predictions.extend(final_prediction_dict[label])
-        return merged_predictions
+        return final_prediction
 
 
 def evaluate(model_checkpoint, revision, root_path, lang, cat):
@@ -292,14 +330,13 @@ def evaluate(model_checkpoint, revision, root_path, lang, cat):
     ner = PredictionNER(model_checkpoint=model_checkpoint, revision=revision)
 
     # conver the predictions to ann format
-    tsv_file_path_test = os.path.join(root_path,  f"test_cardioccc_{lang}_{cat}.tsv")
     test_files_root =  os.path.join(root_path, "txt")
-
+    tsv_file_path_test = os.path.join(root_path, f"test_cardioccc_{lang}_{cat}.tsv")
     test_df = load_tsv_to_dataframe(tsv_file_path_test)
     prd_ann = []
 
     for fn in tqdm(test_df['filename'].unique()):
-
+        # fn = "casos_clinicos_cardiologia508"
         with open(os.path.join(test_files_root, fn+".txt"), 'r', encoding='utf-8') as f:
             document_text = f.read()
             prds = ner.do_prediction(document_text, confidence_threshold=0.35)
@@ -312,11 +349,11 @@ def evaluate(model_checkpoint, revision, root_path, lang, cat):
                     "end_span": prd["end"],
                     "text": prd["text"],
                 })
+        # break 
 
     output_tsv_path = os.path.join(root_path, f"pre_{model_checkpoint.split('/')[1]}_{revision}.tsv")
     write_annotations_to_file(prd_ann, output_tsv_path)
     print(f"output_tsv_path {output_tsv_path}")
-
     
 
 if __name__=="__main__":

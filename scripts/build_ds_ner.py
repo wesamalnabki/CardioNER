@@ -7,85 +7,121 @@ from datasets import Dataset, DatasetDict, Features, Sequence, ClassLabel, Value
 from dotenv import find_dotenv, load_dotenv
 from nltk.tokenize import sent_tokenize
 from tqdm import tqdm
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
 
-MIN_WORDS_IOB_SENT = 128
-MAX_WORDS_IOB_SENT = 384
+
+MAX_TOKENS_IOB_SENT = 256
+OVERLAPPING_LEN = 0
+
+# Split text into sentence-like chunks (page_content only)
+text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    encoding_name='o200k_base',
+    separators=["\n\n\n", "\n\n", "\n", " .", " !", " ?", " ،", " ,", " ", ""],
+    keep_separator=True,
+    chunk_size=MAX_TOKENS_IOB_SENT,
+    chunk_overlap=OVERLAPPING_LEN,
+)
 
 print(load_dotenv(find_dotenv(".env")))
+
+
+def assign_iob_tags(text, token_spans, entities):
+    """
+    Assign IOB tags to tokens based on character-based entity spans.
+
+    Args:
+        text: Original text.
+        token_spans: List of (start, end) character indices for tokens.
+        entities: List of dicts with 'start', 'end', 'tag'.
+
+    Returns:
+        List of (token_text, tag) tuples.
+    """
+    tags = []
+
+    for token in token_spans:
+        token_start, token_end = token.start(), token.end()
+        token_tag = 'O'
+        for entity in entities:
+            ent_start, ent_end, ent_tag = entity[0], entity[1], entity[2]
+            if token_start >= ent_start and token_end <= ent_end:
+                if token_start == ent_start:
+                    token_tag = f'B-{ent_tag}'
+                else:
+                    token_tag = f'I-{ent_tag}'
+                break
+        token_text = text[token_start:token_end]
+        tags.append(f"{token_text}\t{token_tag}")
+    
+    return tags
 
 
 def split_sentence_with_indices(text):
     pattern = r'''
         (?:
-            \d+[.,]?\d*\s*[%$€]?
-        )                                     # Numbers with optional decimal/currency
+            \d+[.,]?\d*\s*[%$€]?               # Numbers with optional decimal/currency
+        )
         |
-        [A-Za-zÀ-ÖØ-öø-ÿ0-9]+(?:-[A-Za-z0-9]+)*  # Words with optional hyphens (e.g., anti-TNF)
+        \w+(?:-\w+)*                           # Words with optional hyphens (Unicode-aware)
         |
         [()\[\]{}]                             # Parentheses and brackets
         |
         [^\w\s]                                # Other single punctuation marks
     '''
-    return list(re.finditer(pattern, text, flags=re.VERBOSE))
+    return list(re.finditer(pattern, text, flags=re.VERBOSE | re.UNICODE))
 
-
-def split_iob_into_sentences(iob_tags, min_words=5, max_words=20):
+def chunk_iob_tagged_text(text, iob_data, token_spans):
     """
-    Splits IOB tags into sub-sentences using NLTK's sentence tokenizer.
-    Ensures that sentences have a length between min_words and max_words.
+    Split long IOB-tagged text into sentence-like chunks using a character splitter,
+    then align tokens and their IOB tags within each chunk.
 
-    Args:
-        iob_tags (list of str): A list of strings in the format "word<TAB>tag".
-        min_words (int): Minimum number of words per sentence.
-        max_words (int): Maximum number of words per sentence.
+    Parameters:
+    - text: str, full input text
+    - iob_data: list of str, IOB tags for each token
+    - token_spans: list of (start, end) tuples or re.Match objects for each token
+
 
     Returns:
-        list of list of str: A list of sub-sentences, where each sub-sentence is a list of "word<TAB>tag" strings.
+    - List of chunks, each a list of 'token<TAB>tag' strings
     """
-    # Combine the words into a single text string
-    text = ' '.join([word_tag.split('\t')[0] for word_tag in iob_tags])
 
-    # Use NLTK to tokenize the text into sentences
-    raw_sentences = sent_tokenize(text)
+    # Convert Match objects to (start, end) tuples if needed
+    token_positions = [(m.start(), m.end()) if hasattr(m, 'start') else m for m in token_spans]
 
-    # Adjust sentence lengths based on thresholds
-    sentences = []
-    buffer = []
-    for sentence in raw_sentences:
-        words = sentence.split()
-        buffer.extend(words)
 
-        if len(buffer) >= min_words:
-            sentences.append(' '.join(buffer[:max_words]))
-            buffer = buffer[max_words:]
+    raw_chunks = text_splitter.split_text(text)
 
-    if buffer:
-        if sentences and len(sentences[-1].split()) + len(buffer) <= max_words:
-            sentences[-1] += ' ' + ' '.join(buffer)
-        else:
-            sentences.append(' '.join(buffer))
+    # Align each chunk manually by finding its first occurrence in text
+    used_indices = set()
+    chunks = []
 
-    # Reconstruct the IOB tags for each sentence
-    sub_sentences = []
-    word_index = 0
+    for chunk_text in raw_chunks:
+        # Find the first unique match position in text to use as a start index
+        start_index = text.find(chunk_text)
 
-    for sentence in sentences:
-        sentence_words = sentence.split()
-        current_sentence = []
+        # Prevent collisions if chunk_text repeats (naïve fallback)
+        while start_index in used_indices:
+            start_index = text.find(chunk_text, start_index + 1)
+        used_indices.add(start_index)
 
-        while word_index < len(iob_tags):
-            word, tag = iob_tags[word_index].split('\t')
-            current_sentence.append(f"{word}\t{tag}")
-            word_index += 1
+        end_index = start_index + len(chunk_text)
 
-            if word in sentence_words:
-                sentence_words.remove(word)
-                if not sentence_words:
-                    break
+        chunk_lines = []
+        for (start, end), tag_full in zip(token_positions, iob_data):
+            if start_index <= start < end_index:
+                token = text[start:end]
+                tag = tag_full.split("\t")[1]
+                wd = tag_full.split("\t")[0]
+                if wd!=token:
+                    print("ERROR HERE")
+                chunk_lines.append(f"{token}\t{tag}")
 
-        sub_sentences.append(current_sentence)
+        if chunk_lines:
+            chunks.append(chunk_lines)
 
-    return sub_sentences
+    return chunks
+
 
 
 def write_iob_to_file(iob_sentences, output_file_path):
@@ -206,7 +242,7 @@ def parse_conll_file(file_path):
 
 def ann2iob_singlefile(text_file_path, annotations):
     # Read the text file
-    with open(text_file_path, 'r', encoding='utf-8-sig') as file:
+    with open(text_file_path, 'r', encoding='utf-8') as file:
         text = file.read()
 
     # Parse annotations
@@ -230,48 +266,16 @@ def ann2iob_singlefile(text_file_path, annotations):
 
     entities = filter_entities(entities)
 
-    # Initialize IOB tags
-    iob_tags = ['O'] * len(text)
+    # Find the word boundaries within the entity span
+    token_spans = split_sentence_with_indices(text)
 
-    # Apply IOB tags
-    # print(entities)
-    for start, end, entity_name, entity_text in entities:
-        if 'anfetamínicos' in entity_text:
-            pass
-        # Find the word boundaries within the entity span
-        entity_words = split_sentence_with_indices(
-            text)  # list(re.finditer(r'([0-9A-Za-zÀ-ÖØ-öø-ÿ]+|[^0-9A-Za-zÀ-ÖØ-öø-ÿ])', entity_text)) # list(re.finditer(r'\S+', entity_text)) #
-        for i, entity_word in enumerate(entity_words):
-            if not entity_word.group().strip():
-                continue
-            word_start = start + entity_word.start()
-            word_end = start + entity_word.end()
-            if i == 0:
-                iob_tags[word_start:word_end] = ['B-' + entity_name] * len(
-                    entity_word.group())  # (word_end - word_start)
-            else:
-                iob_tags[word_start:word_end] = ['I-' + entity_name] * len(
-                    entity_word.group())  # (word_end - word_start)
 
-    # Convert the text and IOB tags into word-level IOB format
-    text_words = split_sentence_with_indices(
-        text)  # list(re.finditer(r'([0-9A-Za-zÀ-ÖØ-öø-ÿ]+|[^0-9A-Za-zÀ-ÖØ-öø-ÿ])', text)) #re.finditer(r'\w+|[^\w\s]', text)
-    iob_output = []
-    for text_word in text_words:
-        word_start = text_word.start()
-        word_end = text_word.end()
-        word_text = text[word_start:word_end]
-        if not word_text.strip():
-            continue
-
-        word_letters_tags = iob_tags[word_start:word_end]
-        if len(set(word_letters_tags)) == 1:
-            word_tag = iob_tags[word_start]
-        else:
-            word_tag = list(set(word_letters_tags).difference("O"))[0]
-        iob_output.append(f"{word_text}\t{word_tag}")
-
-    return iob_output
+    iob_data = assign_iob_tags(text, token_spans, entities)
+    
+    iob_data = chunk_iob_tagged_text(text, iob_data, 
+                                     token_spans)
+    
+    return iob_data
 
 
 def load_tsv_to_dataframe(file_path: str) -> pd.DataFrame:
@@ -310,7 +314,7 @@ def generate_iob(txt_root_dict, tsv_file_path, iob_file_path):
 
     iob_sentences = []
     for sample_name in tqdm(os.listdir(txt_root_dict)):
-
+        # sample_name = "32277408_ES.txt"
         sample_text_file_path = os.path.join(txt_root_dict, sample_name)
 
         # get the annotation of this specific sample:
@@ -320,29 +324,31 @@ def generate_iob(txt_root_dict, tsv_file_path, iob_file_path):
         sample_annotation = sample_df.to_dict(orient="records")
 
         # convert the annotation to IOB (all text):
-        iob_all_text = ann2iob_singlefile(text_file_path=sample_text_file_path,
-                                          annotations=sample_annotation)
-        # split the IOB into sentences:
-        iob_sentences_single_file = split_iob_into_sentences(iob_all_text,
-                                                             min_words=MIN_WORDS_IOB_SENT,
-                                                             max_words=MAX_WORDS_IOB_SENT)
+        iob_file = ann2iob_singlefile(text_file_path=sample_text_file_path,
+                                          annotations=sample_annotation,
+                                         
+                                          )
+                                
+        iob_sentences.extend(iob_file)
 
-        iob_sentences.extend(iob_sentences_single_file)
-
-        # break
     write_iob_to_file(iob_sentences, iob_file_path)
+    
 
+cardio_ds_langs = {
+    "es":"Spanish",
+    "en": "English",
+    "cz": "Czech",
+    "nl": "Dutch",
+    "it": "Italian",
+    "ro": "Romanian",
+    "sv":"Swedish"
+}
 
-def main(root):
-    cardio_ds_langs = {
-        "es": "Spanish",
-        "en": "English",
-        "cz": "Czech",
-        "nl": "Dutch",
-        "it": "Italian",
-        "ro": "Romanian",
-        "sv": "Swedish"
-    }
+for lang_code, lang_name in cardio_ds_langs.items():
+    print(lang_code)
+    root = f"../dataset/{lang_name}"
+    lang = f"{lang_code}"
+
 
     label_dict = {
         "dis": ["B-DISEASE", "I-DISEASE", "O"],
@@ -350,46 +356,27 @@ def main(root):
         "proc": ['B-PROCEDURE', 'I-PROCEDURE', 'O'],
         "symp": ['B-SYMPTOM', 'I-SYMPTOM', 'O'],
     }
-
-    for lang_code, lang_name in cardio_ds_langs.items():
-        print("Processing language:", lang_name)
-        lang_root = f"{root}/{lang_name}"
-        lang = f"{lang_code}"
-
-        for cat in label_dict.keys():
-            print("Processing category:", cat)
-            label_list = label_dict[cat]
-
-            # path to all .txt files
-            txt_root_dict = os.path.join(lang_root, "txt")
-
-            # path to train/test annotations
-            tsv_file_path_train = os.path.join(lang_root, f"train_cardioccc_{lang}_{cat}.tsv")
-            tsv_file_path_test = os.path.join(lang_root, f"test_cardioccc_{lang}_{cat}.tsv")
-
-            # path to save the IOB files
-            iob_file_path_train = os.path.join(lang_root, f"train_cardioccc_{lang}_{cat}.iob")
-            iob_file_path_test = os.path.join(lang_root, f"test_cardioccc_{lang}_{cat}.iob")
-
-            generate_iob(txt_root_dict, tsv_file_path_train, iob_file_path_train)
-            print("IOB Path:", iob_file_path_train)
-            generate_iob(txt_root_dict, tsv_file_path_test, iob_file_path_test)
-            print("IOB Path:", iob_file_path_test)
-
-            HF_dataset = convert_conll_to_datasetdict(iob_file_path_train,
-                                                      test_path=iob_file_path_test,
-                                                      label_list=label_list)
-            HF_dataset
-            # ds.save_to_disk(rf"dataset/processed_dataset_{cat}_{lang}")
+    for cat in label_dict.keys():
+        print(cat)
+        label_list = label_dict[cat]  
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run model with specified configuration.")
+        # path to all .txt files
+        txt_root_dict = os.path.join(root, "txt")
 
-    parser.add_argument("--root", "-p", type=str, help="Path to the dataset root directory.")
+        # path to train/test annotations
+        tsv_file_path_train = os.path.join(root, f"train_cardioccc_{lang}_{cat}.tsv")
+        tsv_file_path_test = os.path.join(root,  f"test_cardioccc_{lang}_{cat}.tsv")
 
-    args = parser.parse_args()
+        # path to save the IOB files
+        iob_file_path_train = os.path.join(root, f"train_cardioccc_{lang}_{cat}.iob")
+        iob_file_path_test = os.path.join(root, f"test_cardioccc_{lang}_{cat}.iob")
 
-    root = args.root  # ./dataset
 
-    main(root)
+        generate_iob(txt_root_dict, tsv_file_path_train, iob_file_path_train)
+        generate_iob(txt_root_dict, tsv_file_path_test, iob_file_path_test)
+
+
+        HF_dataset = convert_conll_to_datasetdict(iob_file_path_train, test_path= iob_file_path_test, label_list=label_list)
+        HF_dataset
+    # ds.save_to_disk(r"dataset/processed_dataset")
